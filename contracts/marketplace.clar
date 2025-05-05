@@ -28,7 +28,8 @@
     status: (string-ascii 20),
     buyer: (optional principal),
     escrow-amount: uint,
-    created-at: uint
+    created-at: uint,
+    expires-at: uint
   }
 )
 
@@ -83,7 +84,8 @@
         status: "active",
         buyer: none,
         escrow-amount: u0,
-        created-at: stacks-block-height
+        created-at: stacks-block-height,
+        expires-at: u0
       }
     )
     (var-set next-listing-id (+ listing-id u1))
@@ -263,5 +265,90 @@
       })
     )
     (ok true)
+  )
+)
+
+
+(define-map categories 
+  { category-id: uint }
+  { name: (string-ascii 50) }
+)
+
+(define-map listing-categories
+  { listing-id: uint }
+  { category-id: uint }
+)
+
+(define-data-var next-category-id uint u1)
+
+(define-public (create-category (name (string-ascii 50)))
+  (let
+    ((category-id (var-get next-category-id)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-insert categories
+      { category-id: category-id }
+      { name: name }
+    )
+    (var-set next-category-id (+ category-id u1))
+    (ok category-id)
+  )
+)
+
+(define-public (set-listing-category (listing-id uint) (category-id uint))
+  (let
+    ((listing (unwrap! (get-listing listing-id) err-not-found)))
+    (asserts! (is-eq (get seller listing) tx-sender) err-unauthorized)
+    (map-set listing-categories
+      { listing-id: listing-id }
+      { category-id: category-id }
+    )
+    (ok true)
+  )
+)
+
+;; (define-read-only (get-listings-by-category (category-id uint))
+;;   (filter list-in-category (map-to-list listings))
+;; )
+
+
+(define-constant listing-duration u10000)
+
+(define-public (create-listing-with-duration 
+    (title (string-ascii 100)) 
+    (description (string-ascii 500)) 
+    (price uint)
+    (duration uint)
+  )
+  (let
+    (
+      (listing-id (var-get next-listing-id))
+      (current-height stacks-block-height)
+      (expiry (+ current-height duration))
+    )
+    (asserts! (> price u0) (err u112))
+    (asserts! (>= duration u1) (err u120))
+    (map-insert listings
+      { listing-id: listing-id }
+      {
+        seller: tx-sender,
+        title: title,
+        description: description,
+        price: price,
+        status: "active",
+        buyer: none,
+        escrow-amount: u0,
+        created-at: current-height,
+        expires-at: expiry
+      }
+    )
+    (var-set next-listing-id (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-read-only (is-listing-expired (listing-id uint))
+  (match (get-listing listing-id)
+    listing (> stacks-block-height (get expires-at listing))
+    false
   )
 )
