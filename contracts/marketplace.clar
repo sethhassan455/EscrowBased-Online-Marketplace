@@ -352,3 +352,121 @@
     false
   )
 )
+
+(define-constant err-already-rated (err u203))
+(define-constant err-invalid-rating (err u204))
+(define-constant err-self-rating (err u205))
+
+(define-map user-reputation
+  { user: principal }
+  {
+    total-rating: uint,
+    rating-count: uint,
+    completed-sales: uint,
+    completed-purchases: uint
+  }
+)
+
+(define-map transaction-ratings
+  { listing-id: uint, rater: principal }
+  {
+    rating: uint,
+    comment: (string-ascii 200),
+    rated-user: principal,
+    created-at: uint
+  }
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (default-to 
+    { total-rating: u0, rating-count: u0, completed-sales: u0, completed-purchases: u0 }
+    (map-get? user-reputation { user: user })
+  )
+)
+
+(define-read-only (get-average-rating (user principal))
+  (let
+    ((reputation (get-user-reputation user)))
+    (if (> (get rating-count reputation) u0)
+      (/ (get total-rating reputation) (get rating-count reputation))
+      u0
+    )
+  )
+)
+
+(define-read-only (get-transaction-rating (listing-id uint) (rater principal))
+  (map-get? transaction-ratings { listing-id: listing-id, rater: rater })
+)
+
+(define-public (rate-user (listing-id uint) (rated-user principal) (rating uint) (comment (string-ascii 200)))
+  (let
+    ((existing-rating (get-transaction-rating listing-id tx-sender))
+     (current-reputation (get-user-reputation rated-user)))
+    
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (not (is-eq tx-sender rated-user)) err-self-rating)
+    (asserts! (is-none existing-rating) err-already-rated)
+    
+    (map-insert transaction-ratings
+      { listing-id: listing-id, rater: tx-sender }
+      {
+        rating: rating,
+        comment: comment,
+        rated-user: rated-user,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set user-reputation
+      { user: rated-user }
+      {
+        total-rating: (+ (get total-rating current-reputation) rating),
+        rating-count: (+ (get rating-count current-reputation) u1),
+        completed-sales: (get completed-sales current-reputation),
+        completed-purchases: (get completed-purchases current-reputation)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-transaction-count (user principal) (is-seller bool))
+  (let
+    ((current-reputation (get-user-reputation user)))
+    (map-set user-reputation
+      { user: user }
+      (if is-seller
+        (merge current-reputation { completed-sales: (+ (get completed-sales current-reputation) u1) })
+        (merge current-reputation { completed-purchases: (+ (get completed-purchases current-reputation) u1) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-user-stats (user principal))
+  (let
+    ((reputation (get-user-reputation user)))
+    {
+      average-rating: (get-average-rating user),
+      total-transactions: (+ (get completed-sales reputation) (get completed-purchases reputation)),
+      completed-sales: (get completed-sales reputation),
+      completed-purchases: (get completed-purchases reputation),
+      rating-count: (get rating-count reputation)
+    }
+  )
+)
+
+(define-read-only (is-trusted-user (user principal))
+  (let
+    ((stats (get-user-stats user)))
+    (and 
+      (>= (get rating-count stats) u5)
+      (>= (get average-rating stats) u4)
+      (>= (get total-transactions stats) u3)
+    )
+  )
+)
+
+
+
