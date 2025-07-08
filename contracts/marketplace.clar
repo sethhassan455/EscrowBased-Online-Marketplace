@@ -377,6 +377,28 @@
   }
 )
 
+(define-map auctions
+  { listing-id: uint }
+  {
+    starting-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    auction-end: uint,
+    bid-increment: uint,
+    reserve-price: uint,
+    auction-type: (string-ascii 20)
+  }
+)
+
+(define-map auction-bids
+  { listing-id: uint, bidder: principal }
+  {
+    bid-amount: uint,
+    bid-time: uint,
+    refunded: bool
+  }
+)
+
 (define-read-only (get-user-reputation (user principal))
   (default-to 
     { total-rating: u0, rating-count: u0, completed-sales: u0, completed-purchases: u0 }
@@ -467,6 +489,272 @@
     )
   )
 )
+
+(define-constant err-invalid-bulk-data (err u114))
+(define-constant max-bulk-listings u10)
+
+(define-constant err-auction-ended (err u115))
+(define-constant err-auction-not-ended (err u116))
+(define-constant err-bid-too-low (err u117))
+(define-constant err-invalid-auction-duration (err u118))
+(define-constant err-not-highest-bidder (err u119))
+
+(define-public (create-bulk-listings (listings-data (list 10 {title: (string-ascii 100), description: (string-ascii 500), price: uint})))
+  (let
+    ((data-length (len listings-data)))
+    (asserts! (> data-length u0) err-invalid-bulk-data)
+    (asserts! (<= data-length max-bulk-listings) err-invalid-bulk-data)
+    
+    (ok (map create-single-listing-from-bulk listings-data))
+  )
+)
+
+(define-private (create-single-listing-from-bulk (listing-data {title: (string-ascii 100), description: (string-ascii 500), price: uint}))
+  (let
+    ((listing-id (var-get next-listing-id))
+     (title (get title listing-data))
+     (description (get description listing-data))
+     (price (get price listing-data)))
+    
+    (if (> price u0)
+      (begin
+        (map-insert listings
+          { listing-id: listing-id }
+          {
+            seller: tx-sender,
+            title: title,
+            description: description,
+            price: price,
+            status: "active",
+            buyer: none,
+            escrow-amount: u0,
+            created-at: stacks-block-height,
+            expires-at: u0
+          }
+        )
+        (var-set next-listing-id (+ listing-id u1))
+        listing-id
+      )
+      u0
+    )
+  )
+)
+
+(define-public (bulk-update-listing-status (listing-ids (list 10 uint)) (new-status (string-ascii 20)))
+  (begin
+    (asserts! (> (len listing-ids) u0) err-invalid-bulk-data)
+    (asserts! (<= (len listing-ids) max-bulk-listings) err-invalid-bulk-data)
+    
+    (ok (fold update-status-fold listing-ids (list)))
+  )
+)
+
+(define-private (update-status-fold (listing-id uint) (acc (list 10 bool)))
+  (let
+    ((listing (unwrap! (get-listing listing-id) (list false)))
+     (result 
+       (if (and (is-eq (get seller listing) tx-sender) (is-eq (get status listing) "active"))
+         (begin
+           (map-set listings
+             { listing-id: listing-id }
+             (merge listing { status: "cancelled" })
+           )
+           true
+         )
+         false
+       )
+     ))
+    (unwrap! (as-max-len? (append acc result) u10) acc)
+  )
+)
+
+(define-read-only (get-auction (listing-id uint))
+  (map-get? auctions { listing-id: listing-id })
+)
+
+(define-read-only (get-auction-bid (listing-id uint) (bidder principal))
+  (map-get? auction-bids { listing-id: listing-id, bidder: bidder })
+)
+
+(define-read-only (is-auction-active (listing-id uint))
+  (match (get-auction listing-id)
+    auction (< stacks-block-height (get auction-end auction))
+    false
+  )
+)
+
+(define-public (create-auction-listing 
+    (title (string-ascii 100)) 
+    (description (string-ascii 500)) 
+    (starting-price uint)
+    (reserve-price uint)
+    (bid-increment uint)
+    (duration uint)
+  )
+  (let
+    (
+      (listing-id (var-get next-listing-id))
+      (current-height stacks-block-height)
+      (auction-end (+ current-height duration))
+    )
+    (asserts! (> starting-price u0) (err u112))
+    (asserts! (>= reserve-price starting-price) (err u117))
+    (asserts! (> bid-increment u0) (err u117))
+    (asserts! (>= duration u144) err-invalid-auction-duration)
+    
+    (map-insert listings
+      { listing-id: listing-id }
+      {
+        seller: tx-sender,
+        title: title,
+        description: description,
+        price: starting-price,
+        status: "auction",
+        buyer: none,
+        escrow-amount: u0,
+        created-at: current-height,
+        expires-at: auction-end
+      }
+    )
+    
+    (map-insert auctions
+      { listing-id: listing-id }
+      {
+        starting-price: starting-price,
+        current-bid: u0,
+        highest-bidder: none,
+        auction-end: auction-end,
+        bid-increment: bid-increment,
+        reserve-price: reserve-price,
+        auction-type: "standard"
+      }
+    )
+    
+    (var-set next-listing-id (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-public (place-bid (listing-id uint) (bid-amount uint))
+  (let
+    (
+      (listing (unwrap! (get-listing listing-id) err-not-found))
+      (auction (unwrap! (get-auction listing-id) err-not-found))
+      (current-highest-bid (get current-bid auction))
+      (required-bid (+ current-highest-bid (get bid-increment auction)))
+      (previous-bidder (get highest-bidder auction))
+    )
+    (asserts! (is-eq (get status listing) "auction") err-wrong-status)
+    (asserts! (is-auction-active listing-id) err-auction-ended)
+    (asserts! (not (is-eq tx-sender (get seller listing))) err-unauthorized)
+    (asserts! (>= bid-amount required-bid) err-bid-too-low)
+    
+    (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+    
+    (match previous-bidder
+      prev-bidder (try! (as-contract (stx-transfer? current-highest-bid (as-contract tx-sender) prev-bidder)))
+      true
+    )
+    
+    (map-set auction-bids
+      { listing-id: listing-id, bidder: tx-sender }
+      {
+        bid-amount: bid-amount,
+        bid-time: stacks-block-height,
+        refunded: false
+      }
+    )
+    
+    (map-set auctions
+      { listing-id: listing-id }
+      (merge auction {
+        current-bid: bid-amount,
+        highest-bidder: (some tx-sender)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-auction (listing-id uint))
+  (let
+    (
+      (listing (unwrap! (get-listing listing-id) err-not-found))
+      (auction (unwrap! (get-auction listing-id) err-not-found))
+      (highest-bidder (get highest-bidder auction))
+      (final-bid (get current-bid auction))
+      (reserve-price (get reserve-price auction))
+      (seller (get seller listing))
+      (fee (calculate-fee final-bid))
+      (seller-amount (- final-bid fee))
+    )
+    (asserts! (is-eq (get status listing) "auction") err-wrong-status)
+    (asserts! (not (is-auction-active listing-id)) err-auction-not-ended)
+    
+    (if (and (is-some highest-bidder) (>= final-bid reserve-price))
+      (begin
+        (try! (as-contract (stx-transfer? seller-amount (as-contract tx-sender) seller)))
+        (try! (as-contract (stx-transfer? fee (as-contract tx-sender) contract-owner)))
+        
+        (map-set listings
+          { listing-id: listing-id }
+          (merge listing {
+            status: "sold",
+            buyer: highest-bidder,
+            escrow-amount: u0
+          })
+        )
+        (ok "sold")
+      )
+      (begin
+        (match highest-bidder
+          winner (try! (as-contract (stx-transfer? final-bid (as-contract tx-sender) winner)))
+          true
+        )
+        
+        (map-set listings
+          { listing-id: listing-id }
+          (merge listing {
+            status: "unsold",
+            buyer: none,
+            escrow-amount: u0
+          })
+        )
+        (ok "unsold")
+      )
+    )
+  )
+)
+
+(define-public (extend-auction (listing-id uint) (additional-blocks uint))
+  (let
+    (
+      (listing (unwrap! (get-listing listing-id) err-not-found))
+      (auction (unwrap! (get-auction listing-id) err-not-found))
+      (new-end (+ (get auction-end auction) additional-blocks))
+    )
+    (asserts! (is-eq (get seller listing) tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status listing) "auction") err-wrong-status)
+    (asserts! (is-auction-active listing-id) err-auction-ended)
+    (asserts! (> additional-blocks u0) (err u112))
+    (asserts! (<= additional-blocks u1008) err-invalid-auction-duration)
+    
+    (map-set auctions
+      { listing-id: listing-id }
+      (merge auction { auction-end: new-end })
+    )
+    
+    (map-set listings
+      { listing-id: listing-id }
+      (merge listing { expires-at: new-end })
+    )
+    
+    (ok true)
+  )
+)
+
+
 
 
 
