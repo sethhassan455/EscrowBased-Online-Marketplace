@@ -168,8 +168,13 @@
     (asserts! (is-eq (some tx-sender) (get buyer listing)) err-not-buyer)
     (asserts! (is-eq (get status listing) "in-escrow") err-not-in-escrow)
     
-    (try! (as-contract (stx-transfer? seller-amount (as-contract tx-sender) seller)))
-    (try! (as-contract (stx-transfer? fee (as-contract tx-sender) contract-owner)))
+    ;; Use tier-based fee calculation instead of fixed fee
+    (let ((tier-fee (calculate-tier-fee price seller))
+          (tier-seller-amount (- price tier-fee)))
+      (try! (as-contract (stx-transfer? tier-seller-amount (as-contract tx-sender) seller)))
+      (try! (as-contract (stx-transfer? tier-fee (as-contract tx-sender) contract-owner)))
+      (unwrap-panic (update-seller-volume seller price))
+    )
     
     (map-set listings
       { listing-id: listing-id }
@@ -498,6 +503,10 @@
 (define-constant err-bid-too-low (err u117))
 (define-constant err-invalid-auction-duration (err u118))
 (define-constant err-not-highest-bidder (err u119))
+(define-constant err-tier-not-eligible (err u120))
+(define-constant err-volume-insufficient (err u121))
+(define-constant err-tier-already-max (err u122))
+(define-constant err-invalid-tier (err u123))
 
 (define-public (create-bulk-listings (listings-data (list 10 {title: (string-ascii 100), description: (string-ascii 500), price: uint})))
   (let
@@ -565,6 +574,255 @@
        )
      ))
     (unwrap! (as-max-len? (append acc result) u10) acc)
+  )
+)
+
+;; Seller tier system constants and data structures
+(define-constant tier-bronze u1)
+(define-constant tier-silver u2)
+(define-constant tier-gold u3)
+(define-constant tier-platinum u4)
+
+;; Tier requirements (sales volume, rating, transaction count)
+(define-constant bronze-min-sales u0)
+(define-constant silver-min-sales u10000)
+(define-constant gold-min-sales u50000)
+(define-constant platinum-min-sales u200000)
+
+(define-constant silver-min-transactions u20)
+(define-constant gold-min-transactions u100)
+(define-constant platinum-min-transactions u500)
+
+(define-constant silver-min-rating u40)
+(define-constant gold-min-rating u45)
+(define-constant platinum-min-rating u48)
+
+;; Commission rates per tier (basis points: 1000 = 10%)
+(define-constant bronze-commission u250)
+(define-constant silver-commission u200)
+(define-constant gold-commission u150)
+(define-constant platinum-commission u100)
+
+(define-map seller-tiers
+  { seller: principal }
+  {
+    current-tier: uint,
+    total-volume: uint,
+    tier-updated-at: uint,
+    monthly-volume: uint,
+    month-start: uint,
+    consecutive-months: uint,
+    tier-benefits-used: uint
+  }
+)
+
+(define-map tier-benefits
+  { seller: principal, benefit-type: (string-ascii 20) }
+  {
+    benefit-value: uint,
+    uses-remaining: uint,
+    expires-at: uint
+  }
+)
+
+(define-read-only (get-seller-tier (seller principal))
+  (default-to 
+    { 
+      current-tier: tier-bronze, 
+      total-volume: u0, 
+      tier-updated-at: u0,
+      monthly-volume: u0,
+      month-start: stacks-block-height,
+      consecutive-months: u0,
+      tier-benefits-used: u0
+    }
+    (map-get? seller-tiers { seller: seller })
+  )
+)
+
+(define-read-only (get-tier-commission-rate (tier uint))
+  (if (is-eq tier tier-platinum)
+    platinum-commission
+    (if (is-eq tier tier-gold)
+      gold-commission
+      (if (is-eq tier tier-silver)
+        silver-commission
+        bronze-commission
+      )
+    )
+  )
+)
+
+(define-read-only (calculate-tier-fee (amount uint) (seller principal))
+  (let
+    ((seller-tier-data (get-seller-tier seller))
+     (tier (get current-tier seller-tier-data))
+     (commission-rate (get-tier-commission-rate tier)))
+    (/ (* amount commission-rate) u10000)
+  )
+)
+
+(define-read-only (get-tier-requirements (target-tier uint))
+  (if (is-eq target-tier tier-platinum)
+    { min-sales: platinum-min-sales, min-transactions: platinum-min-transactions, min-rating: platinum-min-rating }
+    (if (is-eq target-tier tier-gold)
+      { min-sales: gold-min-sales, min-transactions: gold-min-transactions, min-rating: gold-min-rating }
+      (if (is-eq target-tier tier-silver)
+        { min-sales: silver-min-sales, min-transactions: silver-min-transactions, min-rating: silver-min-rating }
+        { min-sales: bronze-min-sales, min-transactions: u0, min-rating: u0 }
+      )
+    )
+  )
+)
+
+(define-read-only (check-tier-eligibility (seller principal) (target-tier uint))
+  (let
+    ((seller-rep (get-user-reputation seller))
+     (seller-tier-data (get-seller-tier seller))
+     (requirements (get-tier-requirements target-tier))
+     (avg-rating (get-average-rating seller)))
+    (and
+      (>= (get total-volume seller-tier-data) (get min-sales requirements))
+      (>= (get completed-sales seller-rep) (get min-transactions requirements))
+      (>= avg-rating (get min-rating requirements))
+    )
+  )
+)
+
+(define-public (update-seller-volume (seller principal) (sale-amount uint))
+  (let
+    ((current-tier-data (get-seller-tier seller))
+     (current-month-start (get month-start current-tier-data))
+     (blocks-per-month u4320) ;; Approximately 30 days worth of blocks
+     (new-monthly-volume 
+       (if (> (- stacks-block-height current-month-start) blocks-per-month)
+         sale-amount
+         (+ (get monthly-volume current-tier-data) sale-amount)
+       ))
+     (new-month-start
+       (if (> (- stacks-block-height current-month-start) blocks-per-month)
+         stacks-block-height
+         current-month-start
+       )))
+    
+    (map-set seller-tiers
+      { seller: seller }
+      (merge current-tier-data {
+        total-volume: (+ (get total-volume current-tier-data) sale-amount),
+        monthly-volume: new-monthly-volume,
+        month-start: new-month-start
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (upgrade-seller-tier (seller principal))
+  (let
+    ((current-tier-data (get-seller-tier seller))
+     (current-tier (get current-tier current-tier-data))
+     (next-tier (+ current-tier u1)))
+    
+    (asserts! (<= next-tier tier-platinum) err-tier-already-max)
+    (asserts! (check-tier-eligibility seller next-tier) err-tier-not-eligible)
+    
+    (map-set seller-tiers
+      { seller: seller }
+      (merge current-tier-data {
+        current-tier: next-tier,
+        tier-updated-at: stacks-block-height,
+        consecutive-months: (+ (get consecutive-months current-tier-data) u1)
+      })
+    )
+    
+    ;; Grant tier benefits
+    (unwrap-panic (grant-tier-benefits seller next-tier))
+    (ok next-tier)
+  )
+)
+
+(define-private (grant-tier-benefits (seller principal) (tier uint))
+  (begin
+    ;; Free listing benefit for higher tiers
+    (if (>= tier tier-silver)
+      (map-set tier-benefits
+        { seller: seller, benefit-type: "free-listings" }
+        {
+          benefit-value: (if (is-eq tier tier-platinum) u10 u5),
+          uses-remaining: (if (is-eq tier tier-platinum) u10 u5),
+          expires-at: (+ stacks-block-height u4320)
+        }
+      )
+      true
+    )
+    
+    ;; Priority support for gold and platinum
+    (if (>= tier tier-gold)
+      (map-set tier-benefits
+        { seller: seller, benefit-type: "priority-support" }
+        {
+          benefit-value: u1,
+          uses-remaining: u1,
+          expires-at: (+ stacks-block-height u4320)
+        }
+      )
+      true
+    )
+    
+    ;; Featured listing for platinum
+    (if (is-eq tier tier-platinum)
+      (map-set tier-benefits
+        { seller: seller, benefit-type: "featured-listing" }
+        {
+          benefit-value: u3,
+          uses-remaining: u3,
+          expires-at: (+ stacks-block-height u4320)
+        }
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (use-tier-benefit (benefit-type (string-ascii 20)))
+  (let
+    ((benefit (unwrap! (map-get? tier-benefits { seller: tx-sender, benefit-type: benefit-type }) (err u124)))
+     (uses-left (get uses-remaining benefit)))
+    
+    (asserts! (> uses-left u0) (err u125))
+    (asserts! (> (get expires-at benefit) stacks-block-height) (err u126))
+    
+    (if (is-eq uses-left u1)
+      (map-delete tier-benefits { seller: tx-sender, benefit-type: benefit-type })
+      (map-set tier-benefits
+        { seller: tx-sender, benefit-type: benefit-type }
+        (merge benefit { uses-remaining: (- uses-left u1) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-seller-benefits (seller principal))
+  (let
+    ((free-listings (map-get? tier-benefits { seller: seller, benefit-type: "free-listings" }))
+     (priority-support (map-get? tier-benefits { seller: seller, benefit-type: "priority-support" }))
+     (featured-listing (map-get? tier-benefits { seller: seller, benefit-type: "featured-listing" })))
+    {
+      free-listings: free-listings,
+      priority-support: priority-support,
+      featured-listing: featured-listing
+    }
+  )
+)
+
+(define-public (downgrade-inactive-sellers)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    ;; This function can be called periodically to downgrade sellers who haven't maintained their tier requirements
+    ;; Implementation would check monthly volume and downgrade if necessary
+    (ok true)
   )
 )
 
@@ -694,8 +952,13 @@
     
     (if (and (is-some highest-bidder) (>= final-bid reserve-price))
       (begin
-        (try! (as-contract (stx-transfer? seller-amount (as-contract tx-sender) seller)))
-        (try! (as-contract (stx-transfer? fee (as-contract tx-sender) contract-owner)))
+        ;; Use tier-based fee for auction sales
+        (let ((tier-fee (calculate-tier-fee final-bid seller))
+              (tier-seller-amount (- final-bid tier-fee)))
+          (try! (as-contract (stx-transfer? tier-seller-amount (as-contract tx-sender) seller)))
+          (try! (as-contract (stx-transfer? tier-fee (as-contract tx-sender) contract-owner)))
+          (unwrap-panic (update-seller-volume seller final-bid))
+        )
         
         (map-set listings
           { listing-id: listing-id }
@@ -753,7 +1016,6 @@
     (ok true)
   )
 )
-
 
 
 
