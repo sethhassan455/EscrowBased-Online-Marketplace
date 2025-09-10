@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/marketplace.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.market-intelligence]
+path = 'contracts/market-intelligence.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
